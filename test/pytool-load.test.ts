@@ -66,6 +66,9 @@ describe("loaded by the pi CLI", () => {
 				"--no-themes",
 				"--no-context-files",
 				"--no-mcp",
+				// discovery off, explicit path on: without this every package the developer has installed loads
+				// into the probe, and one of them commits and pushes the working tree it was started in
+				"--no-extensions",
 				"-e", EXTENSION,
 			],
 			{ cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: "pipe" },
