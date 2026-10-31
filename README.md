@@ -78,8 +78,10 @@ Start `pi` and send Python to `pytool`. Nothing to switch on; the kernel warms i
 ## Interrupts, measured
 
 Aborting a cell (Ctrl-C, or the harness cancelling the call) sends an interrupt, which takes effect at the
-next Python bytecode boundary and cannot enter a blocking call. Measured on Windows, Python 3.14: a loop of
-`time.sleep(0.05)` dies ~0.2 s after the signal; one `time.sleep(3)` finishes its 3 s first. A cell parked
+next Python bytecode boundary and cannot enter a blocking call. Measured on Windows 11, Python 3.14.4, jupyter_client 8.10.0,
+ipykernel 7.4.0 — the Win32 interrupt event handle is present, so this is the primary path and not the
+fallback: a loop of `time.sleep(0.05)` dies 0.49 s after the signal with its names intact; one
+`time.sleep(3)` finishes its 3 s first (2.88 s). A cell parked
 inside a single C call — a hung COM/RPC, a socket read — never regains a boundary, so after
 `PYTOOL_ABORT_GRACE_MS` the kernel is killed and the result says `KernelReaped`: every live handle it held
 died with it, and the next cell boots an empty kernel. The engine survives its kernel.
@@ -121,11 +123,12 @@ npm run typecheck
 ## Status
 
 - Built and gated on Linux (pi 1.4.0, Python 3.14, uv, bun).
-- **Windows: written to the measured rules of the reference (Win32 interrupt event handle, tree kill,
-  `Scripts/python.exe`, `py -3`, `pywin32` in the managed venv) but not yet run there.**
-  [HANDOFF.md](HANDOFF.md) is the Windows plan: the two test changes the gate needs first, the gate sequence,
-  the process-leak and interrupt measurements with a table to fill in, the DraftSight smoke, and a per-site
-  risk table for the platform-specific code.
+- **Windows: gated and measured here.** Windows 11 (10.0.26300), pi 1.4.0, Python 3.14.4 64-bit in the
+  managed venv, bun 1.4.4. The whole four-process chain dies with the session — graceful shutdown clears it in
+  ~0.5 s, before `taskkill` is ever needed — interrupts take the primary Win32 event path
+  (`win32_interrupt_event` is present on jupyter_client 8.10.0 / ipykernel 7.4.0), and a DraftSight COM proxy
+  survives from cell to cell and survives a kernel reap. [HANDOFF.md](HANDOFF.md) holds the numbers, the
+  scripts that produce them (`measure:interrupts`, `measure:process-chain`, `smoke:com`), and the findings.
 
 ## Not
 

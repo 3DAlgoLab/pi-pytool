@@ -34,6 +34,9 @@
 		"test": "bun test pytool-units",
 		"test:integ": "bun test pytool-integration",
 		"test:load": "bun test pytool-load",
+		"measure:interrupts": "bun scripts/measure-interrupts.ts",
+		"measure:process-chain": "bun scripts/measure-process-chain.ts",
+		"smoke:com": "bun scripts/smoke-com-draftsight.ts",
 		"check": "npm run typecheck && bun test pytool"
 	},
 	"peerDependencies": {

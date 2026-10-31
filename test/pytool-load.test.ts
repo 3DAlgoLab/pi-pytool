@@ -15,10 +15,38 @@ const ROOT = join(import.meta.dir, "..");
 const EXTENSION = join(ROOT, "index.ts");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Count the Python tree this tool spawned, matched on the command line rather than the image name.
+ *
+ * POSIX: one `ps -eo args` call. Windows: no ps, and the obvious substitutes (tasklist, or a CIM query for
+ * python.exe) count every interpreter on the machine, so the developer's own Pythons move the number and a
+ * real leak hides in the noise. CIM's CommandLine is the same signal the POSIX filter uses: the bridge and
+ * the ipykernel it launches. Expect four matches there, not two — a venv python.exe is a launcher stub that
+ * re-execs, so each role in the chain costs two processes (HANDOFF §5).
+ */
 function pythonishCount(): number {
-	// the bridge, ipykernel, and whatever else this tool spawns
+	if (process.platform === "win32") {
+		const query =
+			"Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\"" +
+			" | ForEach-Object { $_.CommandLine }";
+		const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", query], {
+			encoding: "utf8",
+			windowsHide: true,
+		});
+		return out.split("\n").filter((l) => /bridge\.py|ipykernel/i.test(l)).length;
+	}
 	const out = execFileSync("ps", ["-eo", "args"], { encoding: "utf8" });
 	return out.split("\n").filter((l) => l.includes("bridge.py") || l.includes("ipykernel")).length;
+}
+
+/**
+ * How to spawn pi's own CLI. On Windows `pi` is a shim pair (pi.ps1 + pi.cmd); a shell-less spawn resolves
+ * neither — .PS1 is not in PATHEXT and a .cmd needs a shell — so `Bun.spawn(["pi", ...])` fails before the
+ * extension is ever loaded. `cmd /c pi` runs the same launcher a real session runs and still pipes RPC
+ * stdin through the shim (verified: the get_commands reply comes back).
+ */
+function piArgv(): string[] {
+	return process.platform === "win32" ? ["cmd", "/c", "pi"] : ["pi"];
 }
 
 describe("loaded in-process", () => {
@@ -58,7 +86,7 @@ describe("loaded by the pi CLI", () => {
 		const baseline = pythonishCount();
 		const child = Bun.spawn(
 			[
-				"pi",
+				...piArgv(),
 				"--mode", "rpc",
 				"--no-session",
 				"--no-skills",

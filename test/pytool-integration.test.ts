@@ -99,13 +99,18 @@ describe("interrupts", () => {
 			await e.execute("gone = 1");
 			const ac = new AbortController();
 			setTimeout(() => ac.abort(), 200);
-			// On POSIX a bare time.sleep IS cut by SIGINT, so it cannot exercise the grace. This cell installs
-			// a handler that swallows the signal and keeps parked: the deterministic stand-in for a call stuck
-			// inside C (a hung COM/RPC), which is exactly what the grace timer exists for.
-			const r = await e.execute(
-				"import signal\nsignal.signal(signal.SIGINT, lambda *a: None)\nimport time\ntime.sleep(10)",
-				{ signal: ac.signal },
-			);
+			// The parked cell is platform-specific, and both halves of the choice are measured, not assumed
+			// (bun scripts/measure-interrupts.ts). On POSIX a bare time.sleep IS cut by SIGINT, so the fixture
+			// installs a handler that swallows the signal to stay parked. On Windows there is no signal to
+			// swallow: the interrupt is a Win32 event that only sets a pending-signal flag, so a cell blocked
+			// inside time.sleep never returns to a bytecode boundary and is already parked — a 1.5 s grace
+			// reaps it (measured: KernelReaped at 1.9 s, next cell NameError). That is the same shape as a
+			// hung COM/RPC, which is what the grace timer exists for.
+			const parkedCell =
+				process.platform === "win32"
+					? "import time\ntime.sleep(10)"
+					: "import signal\nsignal.signal(signal.SIGINT, lambda *a: None)\nimport time\ntime.sleep(10)";
+			const r = await e.execute(parkedCell, { signal: ac.signal });
 			expect(r.status).toBe("aborted");
 			expect(r.error?.name).toBe("KernelReaped");
 			expect(r.error?.message).toContain("COM");
@@ -118,7 +123,12 @@ describe("interrupts", () => {
 		} finally {
 			delete process.env.PYTOOL_ABORT_GRACE_MS;
 		}
-	});
+		// Windows needs a bigger budget than bun's 5 s default, and the reason is process count, not the
+		// abort: this test boots a kernel, reaps it, then boots a second one, and a venv python.exe is a
+		// launcher stub that re-execs, so every boot costs two processes (~2 s per boot measured here; it
+		// fitted under 5 s on Linux). The reap itself lands ~1.4 s in at a 1.2 s grace — the whole 5 s was
+		// spent waiting on the second boot.
+	}, 20_000);
 
 	test("aborting during a cold boot is not lost", async () => {
 		const e = engine();

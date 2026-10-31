@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { capLinesForContext, DEFAULT_MAX_OUTPUT_CHARS, EngineManager, MAX_OUTPUT_LINE_CHARS, formatKernelResetNotice, truncateWithMarker } from "../src/engine/index.js";
-import { KernelClient } from "../src/engine/kernel.js";
+import { killProcessTree, KernelClient } from "../src/engine/kernel.js";
 import { managedVenvPython, pythonCandidates } from "../src/engine/python-locate.js";
 import { formatDiagnostics } from "../src/extension/diagnostics.js";
 import { composeErrorLines } from "../src/extension/error-format.js";
@@ -43,10 +43,16 @@ describe("output caps", () => {
 });
 
 describe("interpreter ladder", () => {
+	// Pins are filtered with existsSync against the *host* filesystem, so a test's pin has to be a file that
+	// exists here. Hardcoding /bin/sh + /bin/bash made this pass on Linux and fail on Windows, where both are
+	// skipped before ordering is ever decided -- the assertion then tested the filter, not the ranking.
+	const pinA = process.execPath;
+	const pinB = join(import.meta.dir, "..", "bridge.py");
 	test("a pin outranks everything and is listed first", () => {
-		const list = pythonCandidates({ PYTOOL_PYTHON: "/bin/sh", PI_PYTHON: "/bin/bash" }, "linux");
+		const list = pythonCandidates({ PYTOOL_PYTHON: pinA, PI_PYTHON: pinB });
 		expect(list[0].source).toBe("pin");
-		expect(list.map((c) => c.argv.join(" "))).toContain("/bin/bash");
+		expect(list[0].argv[0]).toBe(pinA);
+		expect(list.map((c) => c.argv.join(" "))).toContain(pinB);
 	});
 
 	test("an absent absolute candidate is skipped without spawning it", () => {
@@ -141,6 +147,24 @@ describe("bridge pipe routing (fake bridge)", () => {
 		} finally {
 			await kc.shutdown();
 		}
+	});
+});
+
+describe("process teardown", () => {
+	// Windows measures this for real (scripts/measure-process-chain.ts); here it is the contract that the
+	// backstop stays silent and never throws on a chain that is already gone -- the common case, because
+	// shutdown() asks the bridge to stop first. A noisy warning here would train the reader to ignore the
+	// one that means an ipykernel was orphaned.
+	test("killing an already-dead pid neither throws nor warns", () => {
+		const warned: string[] = [];
+		const real = console.error;
+		console.error = (...args: unknown[]) => warned.push(args.join(" "));
+		try {
+			killProcessTree(0x7ffffffe);
+		} finally {
+			console.error = real;
+		}
+		expect(warned.join("")).toBe("");
 	});
 });
 

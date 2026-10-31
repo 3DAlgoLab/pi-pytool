@@ -1,9 +1,10 @@
 # Handoff — pi-pytool on Windows
 
 Built and gated on Linux (pi 1.4.0, Python 3.14.3, uv, bun 1.3.14). Every Windows-specific path below was
-written from measurements taken on a Windows box by the reference implementation (`references/pi-repl-py`),
-**not executed by this port**. Sections 2–3 are the only code that has to change before the gates can run
-there; 4–7 are the measurements that decide whether the port is real.
+written from measurements taken on a Windows box by the reference implementation (`references/pi-repl-py`).
+Sections 2–7 **have since been executed here**: Windows 11 (10.0.26300), pi 1.4.0, Python 3.14.4 64-bit in the
+managed venv, bun 1.4.4, node v26.8.2, jupyter_client 8.10.0, ipykernel 7.4.0. The numbers in §5–§7 are this
+box's, not the reference's, and §11 records what the run found and what it changed.
 
 ## 1. What is proven, and where
 
@@ -91,12 +92,17 @@ reaches the leaf; `detached` is deliberately false on Windows (`kernel.ts:135`) 
 groups, so the tree kill is the whole teardown story. `/pytool` prints the roles and, when the launcher pid
 differs from the bridge pid, the exact `taskkill` line.
 
-Manual measurement, do it even after W1:
+Measured with `scripts/measure-process-chain.ts` (`npm run measure:process-chain`). It walks the tree by
+`ParentProcessId` rather than counting python pids: the venv launcher stub and the bridge share one command
+line, so a flat count cannot tell our chain from an unrelated interpreter.
 
-```powershell
-tasklist /FI "IMAGENAME eq python.exe" /FO CSV /NH | Measure-Object -Line   # baseline
-# start pi, run: pytool cells `x = 1`, a COM connect, /pytool, then exit pi
-```
+| stage | measured |
+| --- | --- |
+| baseline | 0 python in the session's tree |
+| live session | 4 — launcher → bridge → ipykernel launcher → ipykernel interpreter, confirmed by ppid links |
+| normal exit | all 4 gone 507 ms after the `shutdown` op, **before any `taskkill` ran** |
+| tree kill | all 4 gone 570 ms after `taskkill /PID <launcher> /T /F` |
+| orphans | 0 python whose parent is gone |
 
 **Pass:** the count returns to the baseline within ~2 s of pi exiting, and no `python.exe` survives whose
 parent is gone (`wmic process where "name='python.exe'" get ProcessId,ParentProcessId` is the check). A
@@ -107,6 +113,11 @@ Also verify the graceful half before the violent half: on normal exit the bridge
 and ipykernel exits on its own within the 2 s window (`kernel.ts:501`), so `taskkill` should not be needed.
 If `taskkill` is doing all the work every time, the bridge is not reaching its kernel — capture bridge
 stderr.
+
+**Measured:** it is not. The graceful half did the whole job — four processes gone in 507 ms with no `taskkill`
+invoked. `ready` came back as `{"type": "ready", "pid": 21004, "kernel_pid": 6292}` through a CRLF pipe, so the
+`onData` split-and-trim is safe exactly as written. The machine-wide python count stayed at 6 throughout — the
+developer's own interpreters — which is why every census here filters on `CommandLine` and never on image name.
 
 ## 6. Interrupt semantics — re-measure, do not trust the reference numbers
 
@@ -123,14 +134,21 @@ Abort in pi with Ctrl-C (or the harness cancelling the call). Record real number
 
 | cell | expectation | reference measurement | measured here |
 | --- | --- | --- | --- |
-| `for _ in range(200): time.sleep(0.05)` | cut fast, names intact | ~0.2 s | |
-| `time.sleep(3)` | runs its 3 s, then dies | 3 s | |
-| `time.sleep(10)` with grace 1.5 s | `aborted` + `KernelReaped`, next cell says `<pytool_kernel_reset>` | — | |
-| a real hung COM call (`app.Rebuild()` on a wedged drawing) | never regains a boundary → reaped | — | |
+| `for _ in range(200): time.sleep(0.05)` | cut fast, names intact | ~0.2 s | 488 ms latency, 788 ms elapsed, `KeyboardInterrupt`, names intact |
+| `time.sleep(3)` | runs its 3 s, then dies | 3 s | 2.88 s latency, 3.18 s elapsed — it finishes the sleep, then dies |
+| `time.sleep(10)` with grace 1.5 s | `aborted` + `KernelReaped`, next cell says `<pytool_kernel_reset>` | — | `KernelReaped` at 1.71 s, names gone, next cell `NameError`, reset notice present |
+| a real hung COM call (`app.Rebuild()` on a wedged drawing) | never regains a boundary → reaped | — | not provoked on a wedged drawing; the measured analogue is one `ctypes` call that never returns — `KernelReaped` at 1.72 s |
 
 Set the grace low for the last two: `set PYTOOL_ABORT_GRACE_MS=1500` before starting pi. Then confirm the
 next cell carries the reset notice and a `NameError` for a name that existed before — the namespace is gone
 and the model must be told.
+
+Reproduce with `npm run measure:interrupts`, which prints the mechanism line and the four rows in one pass.
+The mechanism on this box:
+`{"jupyter_client": "8.10.0", "ipykernel": "7.4.0", "launcher": "Popen", "win32_interrupt_event": 708, "win_interrupt_module": true, "interrupt_mode": null}`.
+The event handle is **present**, so the primary path in `bridge.py:_interrupt_windows` is live and bridge
+stderr never showed `windows interrupt unavailable`. No `jupyter_client` pin was needed — §8 row 4 is moot on
+8.10.0 / ipykernel 7.4.0.
 
 ## 7. COM smoke — the founding use case
 
@@ -146,10 +164,17 @@ uv pip install --editable --python $env:PI_PYTHON references\draftsight-com
 
 Then in one pi session:
 
-1. `from win32com.client import Dispatch; app = Dispatch("DraftSight.Application")` — cell 1.
-2. `app.ActiveSheet()` and one `sheet.Line(0, 0, 40, 0)` — cell 2, using `app` from cell 1. **This is the
-   whole product: no reconnect, no re-dispatch.** Geometry must appear in the drawing.
-3. A trivial cell (`app.Version`) to prove the proxy is still live rather than a stale reference.
+Measured end to end with `npm run smoke:com` against DraftSight 26.4.0.5067.
+
+1. `app = win32com.client.GetActiveObject('DraftSight.Application')` — cell 1. `Dispatch` is the wrong verb
+   for this job: `GetActiveObject` attaches to the instance that is already running, which is the thing whose
+   state has to survive.
+2. `sh = ds.Sheet(app.GetActiveDocument(), app)` then `sh.line(...)`, `sh.circle(...)` — cell 2, using `app`
+   from cell 1 with no reconnect and no re-dispatch. **This is the whole product, and it works.** The
+   reference's `app.ActiveSheet()` / `sheet.Line()` / `app.Version` are not this build's COM surface: the real
+   path is `GetActiveDocument()` → `GetModel()` → `GetSketchManager()`, and `GetVersion()`. `draftsight_com`
+   wraps exactly that, so call the package instead of guessing property names.
+3. `app.GetVersion()` in a later cell — a live proxy, not a stale reference.
 4. Kill the kernel (a cell parked past the grace, §6), then reconnect in a new cell. Expect a fresh
    connection and a `KernelReaped`/reset notice in between, and expect DraftSight itself to survive and stay
    operable — no zombie lock, no "application is not responding".
@@ -158,6 +183,15 @@ Watch for the classic Windows traps while doing this: 32/64-bit mismatch between
 application, and `MakePath`-style typelib dispatch warm-up. If `Dispatch` works in `python` but not in
 `pytool`, the ladder picked a different interpreter than the one the package went into — `/pytool` shows
 which, and `PYTOOL_PYTHON` (or `PI_PYTHON`) pins it without probing.
+
+**Measured:** inside a cell, `sys.executable` and `os.environ['PI_PYTHON']` name the same managed venv,
+64-bit, and `draftsight_com.__file__` resolves to the editable install there — the contract holds, so the
+wrong-interpreter failure the skill documents never had a chance to happen. After a `KernelReaped`, a fresh
+`GetActiveObject` attached again, the document the dead kernel had been drawing into was **still open in
+DraftSight**, and re-exporting it produced a PNG of the same 5326 bytes: the geometry lived in the app, not
+in the kernel that died. DraftSight stayed up and operable, and the dead session's proxy is really gone
+(`NameError`). Closing the document the kernel created requires activating another document first —
+`ds.close_document` refuses to close the active one because that takes the COM server down.
 
 ## 8. Windows code paths, what each can do wrong
 
@@ -188,6 +222,29 @@ which, and `PYTOOL_PYTHON` (or `PI_PYTHON`) pins it without probing.
 2. §5 pass: process count back to baseline, graceful shutdown doing most of the work.
 3. §6 table filled with measured numbers; if they differ from the reference, update `README.md` "Interrupts,
    measured" and the comment in `bridge.py:_interrupt_windows`.
-4. §7 pass end to end against a live DraftSight, including the kill-and-reconnect.
+4. §7 pass end to end against a live DraftSight, including the kill-and-reconnect. **Done.**
 5. Update `README.md` Status: drop the "not yet run there" line, keep the Linux line, and note the Windows
-   python/pi versions measured. Append the findings here so the next reader sees them in one place.
+   python/pi versions measured. Append the findings here so the next reader sees them in one place. **Done.**
+
+## 11. Findings from the Windows run (2026-10-31: Windows 11, Python 3.14.4, bun 1.4.4)
+
+1. **Quiet `taskkill` fallbacks have to be locale-independent.** The first cut of the retry treated "process
+   not found" as benign by matching English stderr. This box answers in Korean, so every *healthy* graceful
+   shutdown — where the chain is supposed to be gone already — printed a warning. `killProcessTree` now asks
+   the OS whether the root pid still exists (`pidAlive`) rather than reading a localized sentence. Never match
+   localized process-tool text.
+2. **`powershell` on PATH here is 5.1, not 7.** `ConvertTo-Json -AsArray` does not exist, and `ConvertTo-Json`
+   emits a bare object, not an array, when exactly one process matched. Both bit `measure-process-chain.ts`.
+   Anything scripted against `powershell` has to assume 5.1.
+3. **The teardown backstop must never fall through to `child.kill()`** (§8 row 1): a bridge-only kill orphans
+   the ipykernel. It now retries `taskkill /T /F`, and warns only when the root pid is still alive.
+   `test/pytool-units.test.ts` pins the cross-platform half of that — dead pid, no throw, no warning.
+4. **`draftsight-com`'s pi extension resolves the wrong interpreter under pytool.** Its candidate list is
+   hardcoded to `~/.pi/.venv` and `~/.pi/agent/pi-repl/venv`; the second still exists on this box and
+   `~/.pi/agent/pytool/venv` is not in the list at all. Its pin list reads `process.env.PI_PYTHON`, but pytool
+   exports `PI_PYTHON` into the *kernel's* environment, never into the pi process — measured unset there. So
+   the bootstrap installs the package into a stale venv and reports `ready`. The package-only shape was
+   measured working in §7: `uv pip install --python "$PI_PYTHON" --editable <repo>`, verified from inside a
+   cell. Recommendation: keep `draftsight-com` a Python package plus skill, and drop its extension layer.
+5. Two names in §7's procedure were wrong (`ActiveSheet`, `Line`, `Version`); corrected above against the
+   live build.

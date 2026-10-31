@@ -84,6 +84,23 @@ function resolveCwd(requested?: string): string {
 }
 
 /**
+ * Is this pid still an existing process?
+ *
+ * Needed because taskkill's "process not found" text is localized -- on a Korean Windows box it exits 128
+ * with a Korean sentence -- so deciding the benign case by matching stderr is wrong. The benign case has a
+ * locale-independent definition: the root of the chain is already gone, which is normal, because shutdown()
+ * asks the bridge to stop before this backstop runs.
+ */
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
  * Kill the bridge AND the ipykernel it spawned. POSIX: the detached spawn made the bridge a group leader,
  * so one group signal covers both. Windows has no process groups, and killing only the bridge orphans the
  * ipykernel -- which keeps holding whatever it opened (a COM apartment, an open document, a database
@@ -91,8 +108,27 @@ function resolveCwd(requested?: string): string {
  */
 export function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
-		const r = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-		if (!r.error) return;
+		const r = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+			windowsHide: true,
+			stdio: ["ignore", "ignore", "pipe"],
+			encoding: "utf8",
+		});
+		if (!r.error && (r.status === 0 || !pidAlive(pid))) return;
+		// The fallback below reaches the launcher we spawned but NOT the ipykernel leaf, which keeps its COM
+		// apartment and the document it has open -- the exact leak this design exists to prevent, so it must
+		// never happen silently. And the retry keeps /T: that flag is what reaches the children, so the
+		// retry may drop /F (some environments refuse a forced kill of a protected child) but never /T.
+		console.error(
+			`[pytool] taskkill /PID ${pid} /T /F failed: ${
+				r.error?.message ?? ((r.stderr ?? "").trim() || `exit ${r.status}`)
+			}`,
+		);
+		const retry = spawnSync("taskkill", ["/PID", String(pid), "/T"], {
+			windowsHide: true,
+			stdio: ["ignore", "ignore", "pipe"],
+			encoding: "utf8",
+		});
+		if (!retry.error && (retry.status === 0 || !pidAlive(pid))) return;
 	}
 	try {
 		process.kill(-pid, "SIGKILL");
