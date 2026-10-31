@@ -196,3 +196,17 @@ describe("interrupts", () => {
 		await e.dispose();
 	});
 });
+
+describe("stdio encoding", () => {
+	test("non-ASCII cell source survives the protocol pipe", async () => {
+		// The host writes UTF-8; a bridge that decodes with the OS locale codec (cp949 on a Korean
+		// Windows box) delivered replacement characters instead of the literal, so a model could not
+		// put Hangul, CJK, a degree sign or an Ø into generated text. Output was never affected
+		// because json.dumps escapes to ASCII, which made it look like a display bug.
+		const r = await manager.execute('note = "재질 20° Ø8"\nprint(note, [hex(ord(c)) for c in note[:3]], flush=True)');
+		expect(r.status).toBe("ok");
+		expect(r.stdout).toContain("재질");
+		expect(r.stdout).toContain("0xc7ac");
+		expect(r.stdout).not.toContain("\uFFFD");
+	});
+});

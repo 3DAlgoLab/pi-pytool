@@ -311,3 +311,12 @@ in the kernel that died. DraftSight stayed up and operable, and the dead session
    checkout a syncer may own as volatile: commit test work the moment it passes, and re-check a file against
    disk before quoting it — two edits in this session failed on anchors that a read from minutes earlier had
    shown, because the disk had moved.
+10. **Cell source was decoded with the OS locale codec, not UTF-8** (`bridge.py` `use_utf8_stdio`, 0.4.0).
+    The host writes protocol lines as UTF-8; text-mode `sys.stdin` inherited cp949 on this box, so every
+    non-ASCII byte of a cell was redecoded before `json.loads`: `print("재질 20° Ø8")` arrived as `U+FFFD
+    U+C631 U+F9DE U+FFFD` plus Hangul built from the UTF-8 bytes of `°` and `Ø`. Nothing on the output
+    side was wrong (`json.dumps` escapes to ASCII), so the symptom — Korean text turning to junk in a
+    generated CAD note — pointed at the font, not the pipe. Caught only because a `draftsight_com` note
+    width measurement came out wrong: the string being measured was junk, and its bounding box was being
+    divided by the wrong character count. Integration gate `non-ASCII cell source survives the protocol
+    pipe` pins it now.`

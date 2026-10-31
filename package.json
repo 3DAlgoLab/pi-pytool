@@ -1,6 +1,6 @@
 {
 	"name": "pi-pytool",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"type": "module",
 	"description": "A pi extension that adds one tool, pytool: a session-persistent Python kernel that lives alongside the agent's other tools.",
 	"keywords": [

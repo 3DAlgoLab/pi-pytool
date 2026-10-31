@@ -106,6 +106,15 @@ The rule that follows from that, and the one guideline this tool adds to the pro
 many short calls.** Forty COM calls are interruptible between each; one `Rebuild()` is not interruptible at
 all.
 
+## Encoding, measured
+
+The protocol pipe is UTF-8, pinned by `use_utf8_stdio` in `bridge.py`. Before that, text-mode stdin
+used the OS locale codec — cp949 on a Korean Windows box — and redecoded every non-ASCII byte of cell
+source on the way in: `print("재질 20° Ø8")` reached the kernel as `U+FFFD` plus Hangul assembled from
+the UTF-8 bytes of `°` and `Ø`. Output was never affected, because `json.dumps` escapes to ASCII, which
+is why this reads like a font problem and was in fact a transport one. A cell can now carry Hangul,
+CJK, a degree sign or a diameter sign straight into generated CAD text (0.4.0).
+
 ## Layout
 
 ```

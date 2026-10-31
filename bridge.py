@@ -46,6 +46,24 @@ def names_code():
             + "get_ipython().display_pub.publish({" + json.dumps(NAMES_MIME) + ": _js.dumps(__pytool_n)})\n")
 
 
+def use_utf8_stdio():
+    """Pin the protocol pipe to UTF-8 instead of the OS locale codec.
+
+    The host writes protocol lines as UTF-8 (Node default), but text-mode stdin uses the locale codec,
+    which is cp949 on a Korean Windows box (measured). Decoding UTF-8 as cp949 mangles cell source
+    before json.loads sees it: a print("재질") cell arrived as U+FFFD U+C631 U+F9DE U+FFFD, so any
+    Hangul, CJK, degree sign or Ø typed into a cell reached the kernel as garbage. Strict on stdin so a
+    genuinely bad byte is a logged protocol error rather than silent corruption; the outbound side is
+    already ASCII-safe through json.dumps, and is pinned only to keep the contract explicit.
+    """
+    for name, errors in (("stdin", "strict"), ("stdout", "backslashreplace")):
+        stream = getattr(sys, name, None)
+        try:
+            stream.reconfigure(encoding="utf-8", errors=errors)
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 class Bridge:
     def __init__(self):
         self.km = None
@@ -324,6 +342,9 @@ class Bridge:
 
 
 def main():
+    # Before the stdin reader thread starts: every protocol line, including cell source,
+    # is decoded through this.
+    use_utf8_stdio()
     try:
         Bridge().serve()
     except KeyboardInterrupt:
