@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { capLinesForContext, DEFAULT_MAX_OUTPUT_CHARS, EngineManager, MAX_OUTPUT_LINE_CHARS, formatKernelResetNotice, truncateWithMarker } from "../src/engine/index.js";
+import { capLinesForContext, DEFAULT_MAX_OUTPUT_CHARS, EngineManager, MAX_OUTPUT_LINE_CHARS, formatCellTimeoutNotice, formatKernelResetNotice, truncateWithMarker } from "../src/engine/index.js";
 import { killProcessTree, KernelClient } from "../src/engine/kernel.js";
 import { managedVenvPython, pythonCandidates } from "../src/engine/python-locate.js";
 import { formatDiagnostics } from "../src/extension/diagnostics.js";
@@ -14,6 +14,32 @@ const FAKE_BRIDGE = join(import.meta.dir, "fixtures", "fake-bridge.py");
 async function fakeKernel(): Promise<KernelClient> {
 	return KernelClient.start([process.env.PYTHON ?? "python3"], { bridgePath: FAKE_BRIDGE });
 }
+
+describe("cell timeouts", () => {
+	test("a cut that landed says the names and handles survived", () => {
+		const t = formatCellTimeoutNotice(45_000, false);
+		expect(t).toContain("<pytool_cell_timeout>");
+		expect(t).toContain("45s");
+		expect(t).toContain("intact");
+		expect(t).toContain("timeoutMs");
+	});
+
+	test("a reaped cell says the namespace and the live handles are gone", () => {
+		const t = formatCellTimeoutNotice(45_000, true);
+		expect(t).toContain("reaped");
+		expect(t).toContain("COM proxy");
+		expect(t).toContain("smaller cells");
+		// the two notices must not be confusable: one promises the state is alive, the other says it is not
+		expect(t).not.toContain("is intact");
+	});
+
+	test("the default cell cap comes from the environment, and a junk value means no cap", () => {
+		expect(new EngineManager({ env: { PYTOOL_CELL_TIMEOUT_MS: "1500" } }).cellTimeoutDefault).toBe(1500);
+		expect(new EngineManager({ env: { PYTOOL_CELL_TIMEOUT_MS: "0" } }).cellTimeoutDefault).toBe(0);
+		expect(new EngineManager({ env: { PYTOOL_CELL_TIMEOUT_MS: "soon" } }).cellTimeoutDefault).toBe(0);
+		expect(new EngineManager().cellTimeoutDefault).toBe(0);
+	});
+});
 
 describe("output caps", () => {
 	test("truncateWithMarker names the loss", () => {

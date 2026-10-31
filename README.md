@@ -77,6 +77,7 @@ Start `pi` and send Python to `pytool`. Nothing to switch on; the kernel warms i
 | `PYTOOL_TIMEOUT_MS` | silence watchdog: interrupt a cell after this long with no output; `0` (off) by default |
 | `PYTOOL_ABORT_GRACE_MS` | how long an aborted cell gets before the kernel is reaped (`5000`) |
 | `PYTOOL_MAX_OUTPUT_CHARS` | per-cell output cap, `46080`; `4096` per line, cuts marked. A caller with one budget shared across many nested results sets this once; one call can override it with `maxOutputChars` |
+| `PYTOOL_CELL_TIMEOUT_MS` | wall clock each cell gets when the caller named none; `0` (off) by default. One call can override it with `timeoutMs` |
 | `PYTOOL_BOOT_TIMEOUT_MS` | deadline for a kernel that boots but never answers (`90000`) |
 | `PYTOOL_SKIP_VENV=1` | skip the venv build at install time |
 
@@ -91,6 +92,16 @@ inside a single C call — a hung COM/RPC, a socket read — never regains a bou
 `PYTOOL_ABORT_GRACE_MS` the kernel is killed and the result says `KernelReaped`: every live handle it held
 died with it, and the next cell boots an empty kernel. The engine survives its kernel.
 
+A cell can also be handed a wall clock of its own: `timeoutMs` per call, `PYTOOL_CELL_TIMEOUT_MS` for the
+session. That is for a caller living under somebody else's deadline — a nested harness whose own budget is
+about to fire, which would otherwise abandon the cell mid-flight and reap the kernel behind its back. Naming
+a number under that deadline moves the cut inside pytool: interrupt first, a kernel kill only if the cell
+will not yield, and a result carrying `status: "timeout"`, `timedOut`, and a `<pytool_cell_timeout>` notice
+that says in one line whether the names and the live handles survived. Either way, the output the cell had
+reached before the cut comes back. Losing it was a measured cost, not a hypothetical: on 2026-10-31 a
+DraftSight COM batch that hung had printed seven progress lines naming the exact stage it hung at, and the
+abandoned call returned an empty result.
+
 The rule that follows from that, and the one guideline this tool adds to the prompt: **write COM work as
 many short calls.** Forty COM calls are interruptible between each; one `Rebuild()` is not interruptible at
 all.
@@ -102,7 +113,7 @@ bridge.py            the Python side: jupyter_client + ipykernel, one JSON line 
 src/engine/
   python-locate.ts   pin > managed venv > PATH, each non-pin probed for ipykernel/jupyter_client
   kernel.ts          spawn the bridge, route events by id, cap output, kill the process tree
-  index.ts           boot, cell queue, abort grace, reset notice, teardown
+  index.ts           boot, cell queue, cell budget, abort grace, reset notice, teardown
 src/extension/
   prompt.ts          the tool's own description, snippet, guidelines
   import-hint.ts     a failed import: which interpreter, which installer, which pip name
@@ -118,8 +129,8 @@ release it, so teardown is always a tree kill (`taskkill /PID <root> /T /F`, `ki
 ## Tests
 
 ```bash
-bun test pytool-units              # no kernel: routing, caps, interpreter ladder, model-facing text
-bun test pytool-integration        # real ipykernel: persistence, abort, reap, caps
+bun test pytool-units              # no kernel: routing, caps, interpreter ladder, cell budgets, model-facing text
+bun test pytool-integration        # real ipykernel: persistence, abort, reap, cell budgets, caps
 
 # the filter is the file-name stem: bun matches patterns by substring, which would otherwise also
 # reach the vendored tests under references/

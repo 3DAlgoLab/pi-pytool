@@ -130,6 +130,57 @@ describe("interrupts", () => {
 		// spent waiting on the second boot.
 	}, 20_000);
 
+	// --- A cell the CALLER gave a wall clock to. This is the shape a nested caller (fabric_exec and
+	// --- friends) is in: it lives under its own deadline, and without a cell budget of its own it abandons
+	// --- the cell mid-flight, which reaps the kernel and hands back an empty result. Measured 2026-10-31
+	// --- against live DraftSight COM: the abandoned call had printed seven progress lines naming the exact
+	// --- stage it hung at, and every one of them was thrown away with it.
+	test("a cell over its own limit is cut, keeps its names, and returns what it printed", async () => {
+		const e = engine();
+		await e.execute("keep = 11");
+		const r = await e.execute("print('first', flush=True)\nimport time\nfor _ in range(400): time.sleep(0.05)", { timeoutMs: 400 });
+		expect(r.status).toBe("timeout");
+		expect(r.timedOut).toBe(true);
+		expect(r.stdout).toContain("first");
+		expect(r.cellTimeout).toContain("intact");
+		expect(r.cellTimeout).toContain("timeoutMs");
+		// the namespace really is alive — that is the whole promise of the notice
+		const after = await e.execute("keep");
+		expect(after.result).toBe("11");
+		await e.dispose();
+		// The cut lands on the deadline, not on a kernel boot: ~2 s of this budget is the boot itself.
+	}, 25_000);
+
+	test("a cell parked in C blows its own limit, reports the reap, and keeps its partial output", async () => {
+		process.env.PYTOOL_ABORT_GRACE_MS = "1200";
+		try {
+			const e = engine();
+			await e.execute("doomed = 1");
+			// Same platform split as the abort test above: on Windows a cell blocked in a C call never reaches
+			// a bytecode boundary, which is exactly the shape of a hung COM/RPC.
+			const parkedCell =
+				process.platform === "win32"
+					? "print('before the hang', flush=True)\nimport time\ntime.sleep(10)"
+					: "import signal\nsignal.signal(signal.SIGINT, lambda *a: None)\nprint('before the hang', flush=True)\nimport time\ntime.sleep(10)";
+			const r = await e.execute(parkedCell, { timeoutMs: 300 });
+			expect(r.status).toBe("timeout");
+			expect(r.timedOut).toBe(true);
+			expect(r.error?.name).toBe("KernelReaped");
+			expect(r.error?.message).toContain("its own 0.3s limit");
+			// --- the cut used to cost the answer: what the cell printed before hanging went away with it
+			expect(r.stdout).toContain("before the hang");
+			expect(r.cellTimeout).toContain("reaped");
+			expect(r.cellTimeout).toContain("smaller cells");
+			// and the cell after it is honest about the loss
+			const next = await e.execute("doomed");
+			expect(next.kernelReset).toBeDefined();
+			expect(next.error?.name).toBe("NameError");
+			await e.dispose();
+		} finally {
+			delete process.env.PYTOOL_ABORT_GRACE_MS;
+		}
+	}, 25_000);
+
 	test("aborting during a cold boot is not lost", async () => {
 		const e = engine();
 		const ac = new AbortController();

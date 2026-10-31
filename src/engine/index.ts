@@ -36,9 +36,13 @@ export interface ExecuteResult {
 	stdout: string;
 	stderr: string;
 	result?: string;
-	status: "ok" | "error" | "aborted";
+	status: "ok" | "error" | "aborted" | "timeout";
 	error?: EngineExecuteError;
 	durationMs: number;
+	/** The cell ran past its own `timeoutMs`, whether the cut landed or not. */
+	timedOut?: boolean;
+	/** Set when the cell was cut by its own limit: what the cut cost, in the model's terms. */
+	cellTimeout?: string;
 	/** Set when this cell was the first on a rebuilt kernel: every earlier name is gone.
 	 *  There is no snapshot to revive, so the model is told rather than left to assume. */
 	kernelReset?: string;
@@ -49,6 +53,12 @@ export interface ExecuteOptions {
 	signal?: AbortSignal;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
 	maxOutputChars?: number;
+	/**
+	 * Wall clock for this cell. pytool cuts it itself -- interrupt, and only then reap -- so the call comes
+	 * back inside the deadline the caller is already under instead of being abandoned mid-cell. A caller whose
+	 * harness gives up at N seconds sets less than N: the cut then lands where the namespace can survive it.
+	 */
+	timeoutMs?: number;
 }
 
 export interface EngineOptions {
@@ -110,6 +120,32 @@ export function formatKernelResetNotice(): string {
 	].join("\n");
 }
 
+/**
+ * What passing one's own `timeoutMs` cost, in the model's terms. The two outcomes are opposites and only one
+ * sentence tells them apart: an interrupted cell keeps every name and handle it had, a reaped one lost the
+ * namespace and the COM proxies with it. Silence here is the bug -- the model goes on calling a dead proxy.
+ */
+export function formatCellTimeoutNotice(timeoutMs: number, reaped: boolean): string {
+	const seconds = timeoutMs / 1000;
+	return [
+		"<pytool_cell_timeout>",
+		reaped
+			? `The cell passed its own ${seconds}s limit, ignored the interrupt, and its kernel was reaped: every name and every live handle (COM proxy, open file, connection) is gone, and the next cell boots a fresh kernel.`
+			: `The cell passed its own ${seconds}s limit and was interrupted. The kernel is idle and every name and handle it had is intact; the output is what it managed to do up to the cut.`,
+		reaped
+			? "Split the work into smaller cells before retrying: a call parked inside C cannot be interrupted, only killed."
+			: "Retry with a larger timeoutMs, or split the work so no single call can park inside C.",
+		"</pytool_cell_timeout>",
+	].join("\n");
+}
+
+/** Output from a cell that died mid-flight: capped, and marked partial so nobody reads it as the whole story. */
+function finalizePartial(text: string, maxChars: number): string {
+	if (text === "") return "";
+	const capped = truncateWithMarker(text, maxChars, text.length >= maxChars);
+	return `${capped}\n[... the cell was cut before it finished: this is only what it printed up to that point ...]`;
+}
+
 export class EngineManager {
 	private readonly options: EngineOptions;
 	private kernel?: KernelClient;
@@ -120,6 +156,8 @@ export class EngineManager {
 	/** Per-engine: the right abort grace depends on what the cell is doing (see DEFAULT_ABORT_GRACE_MS). */
 	private readonly abortGraceMs: number;
 	private readonly bootTimeoutMs: number;
+	/** Per-cell wall clock when the caller names none (`PYTOOL_CELL_TIMEOUT_MS`); 0 = no cap. */
+	private readonly cellTimeoutMsDefault: number;
 	/**
 	 * Output cap applied when a caller names none. Env-overridable because the right number depends on who
 	 * is reading: a model browsing a REPL wants everything, while a caller with its own shared output budget
@@ -146,6 +184,8 @@ export class EngineManager {
 			Number.isInteger(configuredCap) && configuredCap >= MIN_USEFUL_OUTPUT_CHARS
 				? configuredCap
 				: DEFAULT_MAX_OUTPUT_CHARS;
+		const cellCap = Number(process.env.PYTOOL_CELL_TIMEOUT_MS ?? env.PYTOOL_CELL_TIMEOUT_MS);
+		this.cellTimeoutMsDefault = Number.isFinite(cellCap) && cellCap > 0 ? Math.floor(cellCap) : 0;
 	}
 
 	get isRunning(): boolean {
@@ -155,6 +195,11 @@ export class EngineManager {
 	/** The cap a cell gets when the caller named none; public so the rule can be tested without a kernel. */
 	get outputCharBudget(): number {
 		return this.maxOutputCharsDefault;
+	}
+
+	/** The cell wall clock applied when the caller names none; 0 means no cap. */
+	get cellTimeoutDefault(): number {
+		return this.cellTimeoutMsDefault;
 	}
 
 	/** Spawned pid (the venv launcher on Windows). See KernelClient for the three-role explanation. */
@@ -315,14 +360,19 @@ export class EngineManager {
 			let withdrawn = false;
 			let aborted = false;
 			let graceTimer: ReturnType<typeof setTimeout> | undefined;
+			let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+			// --- the cell's own wall clock fired: the cut came from pytool, not from a caller giving up
+			let deadlineHit = false;
 			// --- the grace expiring means the cell never reached a Python boundary: the kernel was reaped, and
 			// --- every live handle it held (COM proxy, open file, connection) died with it. The model has to be
 			// --- told, because "aborted" alone implies the namespace is intact.
 			let reapedDuringAbort = false;
-			const onAbort = () => {
-				withdrawn = true;
-				aborted = true;
-				this.kernel?.requestInterrupt();
+			// --- one cut path for both reasons to cut: the caller aborting, and the cell passing its own limit.
+			const cutCell = () => {
+				// --- never interrupt an idle kernel: on Windows the interrupt is an event the kernel waits on, and
+				// --- an event set between cells surfaces as a KeyboardInterrupt inside the NEXT cell -- a ghost
+				// --- failure in a cell that was never late. Only a cell in flight gets cut.
+				if (this.kernel?.hasActiveCell) this.kernel.requestInterrupt();
 				// --- interrupt is a real KeyboardInterrupt, but a C-wedged cell ignores it; then kill and rebuild ---
 				graceTimer = setTimeout(() => {
 					if (this.state === "running" && this.kernel) {
@@ -336,6 +386,11 @@ export class EngineManager {
 					}
 				}, this.abortGraceMs);
 				graceTimer.unref?.();
+			};
+			const onAbort = () => {
+				withdrawn = true;
+				aborted = true;
+				cutCell();
 			};
 			if (opts.signal) opts.signal.addEventListener("abort", onAbort, { once: true });
 			await this.start();
@@ -355,25 +410,50 @@ export class EngineManager {
 			}
 
 			const maxChars = opts.maxOutputChars ?? this.maxOutputCharsDefault;
+			const cellTimeoutMs = Number(opts.timeoutMs ?? this.cellTimeoutMsDefault) || 0;
 			const resetNotice = this.takeResetNotice();
+			// Channel cap (truncateWithMarker), then per-line cap; both append a marker so the loss is explicit.
+			const finalize = (text: string, channelTruncated: boolean, channelDropped = 0): string => {
+				let out = truncateWithMarker(text, maxChars, channelTruncated, channelDropped);
+				const line = capLinesForContext(out);
+				out = line.trimmed
+					? `${line.text}\n[... some lines exceeded ${MAX_OUTPUT_LINE_CHARS} chars and were cut — slice the value or print it in chunks ...]`
+					: line.text;
+				return out;
+			};
+			// --- the cell output mirrored here as it arrives. A cell that dies mid-flight resolves nothing, and
+			// --- the answer used to be an empty result: the progress log of a long COM batch -- the one thing
+			// --- that names which call hung -- went away with it. Measured 2026-10-31 against live DraftSight.
+			let partialOut = "";
+			let partialErr = "";
+			const capture = (chunk: string, name: "stdout" | "stderr"): void => {
+				const room = maxChars - (name === "stdout" ? partialOut.length : partialErr.length);
+				if (room > 0) {
+					if (name === "stdout") partialOut += chunk.slice(0, room);
+					else partialErr += chunk.slice(0, room);
+				}
+				opts.onStream?.(chunk, name);
+			};
+			if (cellTimeoutMs > 0) {
+				deadlineTimer = setTimeout(() => {
+					deadlineHit = true;
+					cutCell();
+				}, cellTimeoutMs);
+				deadlineTimer.unref?.();
+			}
 			try {
 				const r = await this.kernel!.executeCell(code, {
 					signal: opts.signal,
-					onStream: opts.onStream,
+					onStream: capture,
 					maxOutputChars: maxChars,
 				});
-				const status: ExecuteResult["status"] = opts.signal?.aborted ? "aborted" : r.status;
-				// Channel cap (truncateWithMarker), then per-line cap; both append a marker so the loss is explicit.
-				const finalize = (text: string, channelTruncated: boolean, channelDropped = 0): string => {
-					let out = truncateWithMarker(text, maxChars, channelTruncated, channelDropped);
-					const line = capLinesForContext(out);
-					out = line.trimmed
-						? `${line.text}\n[... some lines exceeded ${MAX_OUTPUT_LINE_CHARS} chars and were cut — slice the value or print it in chunks ...]`
-						: line.text;
-					return out;
-				};
+				// --- the cell came back after its own deadline: either the interrupt cut it (names intact) or it
+				// --- finished in the last moments, and nothing was lost, so nothing is claimed about a cut.
+				const cutByInterrupt = r.status === "aborted" || r.error?.name === "KeyboardInterrupt";
+				const selfCut = deadlineHit && cutByInterrupt && !reapedDuringAbort;
+				const status: ExecuteResult["status"] = opts.signal?.aborted ? "aborted" : selfCut ? "timeout" : r.status;
 				const reapedError: EngineExecuteError | undefined = reapedDuringAbort
-					? { name: "KernelReaped", message: reapedMessage(this.abortGraceMs), stack: [] }
+					? { name: "KernelReaped", message: reapedMessage(this.abortGraceMs, deadlineHit ? cellTimeoutMs : undefined), stack: [] }
 					: undefined;
 				return {
 					stdout: finalize(r.stdout, r.truncated?.stdout ?? false, r.truncated?.stdoutDropped ?? 0),
@@ -383,29 +463,45 @@ export class EngineManager {
 					status,
 					durationMs: Date.now() - started,
 					...(resetNotice ? { kernelReset: resetNotice } : {}),
+					...(deadlineHit ? { timedOut: true } : {}),
+					...(selfCut ? { cellTimeout: formatCellTimeoutNotice(cellTimeoutMs, false) } : {}),
 				};
 			} catch (error) {
-				if (aborted) {
+				if (aborted || deadlineHit) {
+					// --- the cell died mid-flight: the channels come from what was streamed, not from a snapshot
+					const reaped = reapedDuringAbort;
 					return {
-						stdout: "",
-						stderr: "",
-						status: "aborted",
+						stdout: finalizePartial(partialOut, maxChars),
+						stderr: finalizePartial(partialErr, maxChars),
+						status: deadlineHit && !aborted ? "timeout" : "aborted",
 						durationMs: Date.now() - started,
-						...(reapedDuringAbort
+						...(reaped
 							? {
 									error: {
 										name: "KernelReaped",
-										message: reapedMessage(this.abortGraceMs),
+										message: reapedMessage(this.abortGraceMs, deadlineHit ? cellTimeoutMs : undefined),
 										stack: [],
 									} satisfies EngineExecuteError,
 								}
-							: {}),
+							: deadlineHit
+								? {
+										// --- the bridge died with a cell in flight and never said why
+										error: {
+											name: "CellAbandoned",
+											message: `the cell passed its own ${cellTimeoutMs / 1000}s limit and died mid-flight`,
+											stack: [],
+										} satisfies EngineExecuteError,
+									}
+								: {}),
+						...(deadlineHit ? { timedOut: true } : {}),
+						...(deadlineHit ? { cellTimeout: formatCellTimeoutNotice(cellTimeoutMs, reaped) } : {}),
 					};
 				}
 				throw error;
 			} finally {
 				opts.signal?.removeEventListener("abort", onAbort);
 				if (graceTimer) clearTimeout(graceTimer);
+				if (deadlineTimer) clearTimeout(deadlineTimer);
 			}
 		} finally {
 			release();
@@ -430,9 +526,13 @@ export class EngineManager {
 	}
 }
 
-function reapedMessage(graceMs: number): string {
+function reapedMessage(graceMs: number, ownLimitMs?: number): string {
+	const lead =
+		ownLimitMs === undefined
+			? 'the cell ignored the interrupt'
+			: `the cell passed its own ${ownLimitMs / 1000}s limit and then ignored the interrupt`;
 	return (
-		`the cell ignored the interrupt for ${graceMs / 1000}s — it was parked inside a C call, which no interrupt ` +
+		`${lead} for ${graceMs / 1000}s — it was parked inside a C call, which no interrupt ` +
 		"can cut — so the kernel was killed. Every live object the cell held (COM proxy, open file, database " +
 		"connection) died with it, and the namespace is empty: the next cell boots a fresh kernel."
 	);

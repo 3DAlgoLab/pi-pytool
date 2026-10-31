@@ -19,11 +19,19 @@ const pytoolSchema = Type.Object({
 				"Optional cap on characters returned across stdout and stderr. Set it lower when the caller has its own output budget shared across nested results; the session default is 46080 and can be changed with PYTOOL_MAX_OUTPUT_CHARS.",
 		}),
 	),
+	timeoutMs: Type.Optional(
+		Type.Number({
+			description:
+				"Optional wall-clock cap for this cell, in milliseconds. Set it below the deadline the caller is already under: pytool then cuts the cell itself (interrupt first, a kernel kill only if the cell will not yield), returns what it printed up to the cut, and states whether the names and live handles survived. With no cap, a cell that outruns the caller deadline is abandoned mid-cell and its kernel gets reaped behind the scenes.",
+		}),
+	),
 });
 
 interface PytoolDetails {
-	status?: "ok" | "error" | "aborted";
+	status?: "ok" | "error" | "aborted" | "timeout";
 	durationMs?: number;
+	/** The cell ran past its own `timeoutMs`; the cut is reported, not swallowed. */
+	timedOut?: boolean;
 	errorName?: string;
 	stdout?: string;
 	stderr?: string;
@@ -122,12 +130,13 @@ export default function (pi: ExtensionAPI) {
 				const r = await m.execute(params.code, {
 					signal,
 					maxOutputChars: params.maxOutputChars,
+					timeoutMs: params.timeoutMs,
 					onStream: (chunk) => {
 						streamed += chunk;
 						onUpdate?.({ content: [{ type: "text", text: streamed }], details: {} });
 					},
 				});
-				const sections = [r.kernelReset, r.stdout, r.stderr, r.result];
+				const sections = [r.kernelReset, r.cellTimeout, r.stdout, r.stderr, r.result];
 				const errorLines = r.error ? composeErrorLines(r.error) : undefined;
 				if (errorLines) sections.push(errorLines.join("\n"));
 				// --- a missing package is an install, not a rewrite. Without this the model spends its next three
@@ -152,6 +161,7 @@ export default function (pi: ExtensionAPI) {
 						errorStack: errorLines,
 						installHint: installHint?.join("\n"),
 						kernelReset: r.kernelReset !== undefined,
+						timedOut: r.timedOut === true,
 					},
 				};
 			} catch (error) {

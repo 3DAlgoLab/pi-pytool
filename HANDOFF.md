@@ -283,3 +283,31 @@ in the kernel that died. DraftSight stayed up and operable, and the dead session
    empty module list, so the hint printed `uv pip install --python "<py>"` and would have installed nothing —
    worse than silence, because it reads as an instruction. The module list is now part of that call, and a unit
    test pins the shape. Gates: 26 unit tests, integration 9, load 2 (real pi CLI boot), typecheck clean.
+8. **A cell had no wall clock of its own, so a caller under a deadline it never named lost the cell, the
+   kernel, and the evidence at once** (2026-10-31, DraftSight drawing session, v0.3.0). The cells were running
+   inside a `fabric_exec` program whose own deadline was shorter than the COM loop. The program died, its
+   `AbortSignal` fired, the abort did **not** stop the cell — it was parked inside a COM call — and the engine
+   treated the abandoned cell as the caller's choice: the grace timer never armed, no `KernelReaped` was
+   raised, and the kernel was left running a cell nobody was waiting for. Then the answer went missing: the cell
+   had printed seven progress lines naming the exact call it hung on, and an aborted cell returned an empty
+   result, so the one fact that would have changed the next attempt was discarded with it. `maxOutputChars`
+   existed per call; nothing did for time, so the only deadline in the system belonged to a caller that had no
+   idea it was aborting Python work.
+   - `timeoutMs` per call, `PYTOOL_CELL_TIMEOUT_MS` for the session, default `0` (off). A caller already under a
+     deadline names a number under it, and the cut then happens inside pytool instead of by abandonment.
+   - One cut path (`cutCell`) for both reasons to cut — the caller aborting, and the cell passing its limit —
+     both guarded by `hasActiveCell`, so nothing can queue an interrupt against an idle kernel.
+   - New result surface: `status: "timeout"`, `timedOut`, and a `<pytool_cell_timeout>` notice that says in one
+     line whether the names and the live handles survived, because "it stopped" alone invites the model to
+     assume the writes landed and re-apply them. `reapedMessage` now also names which limit fired.
+   - The cell output is mirrored as it streams, so a cell that dies mid-flight still returns what it printed.
+   - Verified against the shape of the real failure: a yielding cell cut at 400 ms keeps its namespace (`keep`
+     → `11` one cell later); a cell parked in C is reaped at its own limit with `before the hang` still in
+     `stdout` and the next cell getting `<pytool_reset>`. Gates: 29 unit tests, integration 11, load 2,
+     typecheck clean under both tsconfigs.
+9. **Uncommitted work in this checkout can vanish under a sync.** Mid-session the tree was reset to
+   `@{upstream}` (`git reflog`: `reset: moving to @{upstream}^{commit}`) and test additions that existed only in
+   the working tree were gone — `grep -r` over the repo, the npm copy and `D:\dev-pi` found no copy. Treat a
+   checkout a syncer may own as volatile: commit test work the moment it passes, and re-check a file against
+   disk before quoting it — two edits in this session failed on anchors that a read from minutes earlier had
+   shown, because the disk had moved.
