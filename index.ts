@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { DEFAULT_MAX_OUTPUT_CHARS, EngineManager } from "./src/engine/index.js";
 import { formatDiagnostics } from "./src/extension/diagnostics.js";
 import { composeErrorLines } from "./src/extension/error-format.js";
+import { composeImportHint, missingModuleNames, probeInstaller } from "./src/extension/import-hint.js";
 import { pytoolGuidelines, pytoolToolDescription, pytoolToolSnippet } from "./src/extension/prompt.js";
 
 const pytoolSchema = Type.Object({
@@ -28,6 +29,8 @@ interface PytoolDetails {
 	stderr?: string;
 	result?: string;
 	errorStack?: string[];
+	/** The install command for a package the kernel interpreter lacks, when an import failed for that reason. */
+	installHint?: string;
 	/** True when this cell was the first on a rebuilt kernel (namespace empty). */
 	kernelReset?: boolean;
 }
@@ -127,6 +130,14 @@ export default function (pi: ExtensionAPI) {
 				const sections = [r.kernelReset, r.stdout, r.stderr, r.result];
 				const errorLines = r.error ? composeErrorLines(r.error) : undefined;
 				if (errorLines) sections.push(errorLines.join("\n"));
+				// --- a missing package is an install, not a rewrite. Without this the model spends its next three
+				// --- calls rediscovering which interpreter runs the kernel, whether that interpreter has pip, and what
+				// --- the pip name of the import is -- all three of which the extension already knows.
+				const missing = r.error ? missingModuleNames(r.error) : [];
+				const interpreter = m.pythonInterpreter;
+				const installHint =
+					missing.length > 0 && interpreter ? composeImportHint(missing, interpreter, probeInstaller(interpreter, missing)) : undefined;
+				if (installHint) sections.push(installHint.join("\n"));
 				if (r.status === "aborted" && !errorLines) sections.push("[cell aborted]");
 				const text = sections.filter((s) => s !== undefined && s !== "").join("\n");
 				return {
@@ -139,6 +150,7 @@ export default function (pi: ExtensionAPI) {
 						stderr: r.stderr || undefined,
 						result: r.result,
 						errorStack: errorLines,
+						installHint: installHint?.join("\n"),
 						kernelReset: r.kernelReset !== undefined,
 					},
 				};

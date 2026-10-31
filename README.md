@@ -53,7 +53,8 @@ pi install git:github.com/3DAlgoLab/pi-pytool
 ```
 
 `postinstall` builds the venv the kernel needs at `~/.pi/agent/pytool/venv` (`uv` when present, `pip`
-otherwise; `pywin32` on Windows). If `python3` or the network is missing it says so plainly instead of
+otherwise; `pywin32` on Windows), and seeds it with `pip` — `uv venv --seed` on a fresh build, `ensurePip` in
+place on a venv that predates that flag. If `python3` or the network is missing it says so plainly instead of
 half-building. On a clone: `npm install`, or `npm run setup-venv` alone. `PYTOOL_SKIP_VENV=1` defers it.
 
 ## Use
@@ -65,6 +66,10 @@ Start `pi` and send Python to `pytool`. Nothing to switch on; the kernel warms i
 - A cell that raises reports the traceback and the kernel keeps everything it had.
 - `/pytool` is read-only diagnostics: interpreter and which rule picked it, the three process roles with
   their pids, the live names in the namespace, the output cap.
+- A cell that fails on a missing package names the interpreter that runs the kernel and prints the command
+  that installs into it — `uv pip install --python "<that interpreter>" <pkg>` when uv owns the machine, that
+  interpreter's own pip otherwise — plus the pip name when it differs from the import name (`PIL` → `pillow`,
+  `yaml` → `pyyaml`, `win32com` → `pywin32`). The same text is in `details.installHint`.
 
 | Variable | Effect |
 | --- | --- |
@@ -100,6 +105,7 @@ src/engine/
   index.ts           boot, cell queue, abort grace, reset notice, teardown
 src/extension/
   prompt.ts          the tool's own description, snippet, guidelines
+  import-hint.ts     a failed import: which interpreter, which installer, which pip name
   diagnostics.ts     /pytool output
 scripts/setup-venv.mjs  the managed venv, uv-aware, platform-aware
 ```

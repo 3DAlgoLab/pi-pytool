@@ -7,7 +7,9 @@
  * the other is a dead evaluator hiding behind a healthy-looking install log.
  *
  * Everything runs through spawn, never a shell, so a profile path containing spaces cannot break the
- * install. A uv-created venv has no pip of its own, so installs go through uv whenever uv is present.
+ * install. A uv-created venv has no pip of its own, so installs go through uv whenever uv is present -- but
+ * the venv is seeded with pip anyway, because the next session's agent reaches for "python -m pip install"
+ * by reflex, and a failure there costs it several calls to find its way back to uv.
  */
 
 import { spawnSync } from "node:child_process";
@@ -93,6 +95,36 @@ function reportExtras() {
 	warn(`installed but not importable: ${names.join(", ")} — COM work will not load.`);
 }
 
+/**
+ * Give the venv the pip module if it lacks one.
+ *
+ * A venv without pip is a trap for the next session: the first missing package makes the agent run
+ * "python -m pip install", watch it die with "No module named pip", and go looking for some other
+ * interpreter -- which is where packages end up installed somewhere the kernel never runs. Failure here is a
+ * warning, not a dead install: the evaluator works without pip, and pytool's import hint prints the uv form.
+ */
+function ensurePip(uv) {
+	if (missingModules(PY, ["pip"]).length === 0) return;
+	try {
+		if (uv) run("uv", ["pip", "install", "--python", PY, "pip"]);
+		else run(PY, ["-m", "ensurepip", "--upgrade"]);
+	} catch (error) {
+		warn(`could not add pip to the venv (${error?.message ?? error}); install packages with uv against ${PY}.`);
+		return;
+	}
+	if (missingModules(PY, ["pip"]).length > 0) {
+		warn(`pip is still not importable in ${VENV_DIR}; install packages with uv against ${PY}.`);
+		return;
+	}
+	log("added pip to the venv.");
+}
+
+/** Say how to add a package later, in the form that targets this interpreter rather than PATH python. */
+function logAddPackages(uv) {
+	const cmd = uv ? `uv pip install --python "${PY}" <pkg>` : `"${PY}" -m pip install <pkg>`;
+	log(`add packages with: ${cmd}`);
+}
+
 function installDeps(uv) {
 	if (uv) {
 		run("uv", ["pip", "install", "--python", PY, ...INSTALL_PACKAGES]);
@@ -106,7 +138,9 @@ function installDeps(uv) {
 function createVenv(system, prefix, uv) {
 	mkdirSync(join(VENV_DIR, ".."), { recursive: true });
 	if (uv) {
-		run("uv", ["venv", "--python", system, ...prefix, VENV_DIR]);
+		// --seed puts pip in the venv: without it an agent mid-session cannot install the one package it needs
+		// unless it already knows this venv was built by uv
+		run("uv", ["venv", "--seed", "--python", system, ...prefix, VENV_DIR]);
 		return;
 	}
 	// --clear: a half-built venv must not leak into a "working" one
@@ -120,13 +154,16 @@ function main() {
 	}
 
 	// an existing venv that can host every dep is the common case — never touch it
+	const uv = hasUv();
+
+	// an existing venv that can host every dep is the common case -- never rebuild it, apart from pip
 	const missing = existsSync(PY) ? missingModules(PY, CORE_MODULES) : null;
 	if (missing && missing.length === 0) {
+		ensurePip(uv);
 		log(`venv ready (${INSTALL_PACKAGES.join(", ")}) at ${VENV_DIR}`);
+		logAddPackages(uv);
 		return;
 	}
-
-	const uv = hasUv();
 
 	if (missing && missing.length > 0) {
 		log(`repairing evaluator venv at ${VENV_DIR} (missing ${missing.join(", ")})...`);
@@ -138,7 +175,9 @@ function main() {
 		const still = missingModules(PY, CORE_MODULES);
 		if (still.length > 0) fail(`deps still not importable after install: ${still.join(", ")} — the evaluator won't start.`);
 		reportExtras();
+		ensurePip(uv);
 		log("done. pytool will use this venv.");
+		logAddPackages(uv);
 		return;
 	}
 
@@ -164,7 +203,9 @@ function main() {
 			return;
 		}
 		reportExtras();
+		ensurePip(uv);
 		log(`done. pytool will use this venv (${INSTALL_PACKAGES.join(", ")}).`);
+		logAddPackages(uv);
 	} catch (error) {
 		// a real failure must exit non-zero — never hand the user a dead evaluator
 		fail(`could not build the evaluator venv (${error?.message ?? error}).`);

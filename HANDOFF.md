@@ -266,3 +266,20 @@ in the kernel that died. DraftSight stayed up and operable, and the dead session
    install also silently writes its help tree somewhere else. And the help pages are UTF-8 while this console
    is cp949 — the `ds-docs` CLI reconfigures its own stdout, a script calling `docs.lookup()` directly has to
    do the same or it dies on the first non-breaking space.
+7. **A missing package cost the agent four calls it should not have paid** (2026-10-31, measured while plotting
+   GELU). The chain was: `ModuleNotFoundError: No module named 'matplotlib'` → a cell to print `sys.executable`
+   → `python -m pip install` dying on `No module named pip`, because the managed venv is uv-built and was never
+   seeded → `where uv` → only then the install that worked. Nothing in the traceback names the interpreter, and a
+   venv without pip is invisible until it bites. Two changes follow.
+   - `src/extension/import-hint.ts`: a failed import appends the kernel interpreter, the one install command that
+     targets it, and the import-name → pip-name mapping (`PIL` → `pillow`, `yaml` → `pyyaml`, `sklearn` →
+     `scikit-learn`, `win32com` → `pywin32`, ...). The installer is *probed*, not guessed: `uv --version` on the
+     machine and `find_spec("pip")` on that interpreter, both process-cached and paid only after a cell already
+     failed. Dotted names collapse to what is installable (`scipy.optimize` → `scipy`).
+   - `scripts/setup-venv.mjs`: `uv venv --seed`, and `ensurePip` repairing an existing venv in place, so
+     `"${PY}" -m pip install` works by reflex. Non-fatal — the evaluator does not need pip, and the hint prints
+     the uv form when seeding fails. This box's venv is seeded: `find_spec("pip")` is now non-None.
+   **A live probe of the new path caught a bug in the first cut**: `probeInstaller` built the command from an
+   empty module list, so the hint printed `uv pip install --python "<py>"` and would have installed nothing —
+   worse than silence, because it reads as an instruction. The module list is now part of that call, and a unit
+   test pins the shape. Gates: 26 unit tests, integration 9, load 2 (real pi CLI boot), typecheck clean.

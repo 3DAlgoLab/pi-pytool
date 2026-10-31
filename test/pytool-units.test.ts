@@ -7,6 +7,7 @@ import { killProcessTree, KernelClient } from "../src/engine/kernel.js";
 import { managedVenvPython, pythonCandidates } from "../src/engine/python-locate.js";
 import { formatDiagnostics } from "../src/extension/diagnostics.js";
 import { composeErrorLines } from "../src/extension/error-format.js";
+import { composeImportHint, installerChoice, installerCommand, missingModuleNames, pipName } from "../src/extension/import-hint.js";
 
 const FAKE_BRIDGE = join(import.meta.dir, "fixtures", "fake-bridge.py");
 
@@ -207,5 +208,75 @@ describe("model-facing text", () => {
 		// Windows-style tree: a launcher distinct from the bridge names the one kill that clears the chain
 		const win = formatDiagnostics({ enginePresent: true, pid: 100, bridgePid: 101, maxOutputChars: 1, namespaceNames: [] });
 		expect(win).toContain("taskkill /PID 100 /T /F");
+	});
+});
+
+describe("import hints", () => {
+	// A bare ModuleNotFoundError costs the model three more calls: which interpreter runs the kernel, whether
+	// it has pip, and what the pip name of the import is. These tests are the gate that the failing cell itself
+	// answers all three. No probes here: the installer is injected.
+	const VENV_PY = process.platform === "win32" ? "C:\\venv\\Scripts\\python.exe" : "/venv/bin/python3";
+
+	test("a missing module is read out of the message", () => {
+		expect(missingModuleNames({ name: "ModuleNotFoundError", message: "No module named 'matplotlib'", stack: [] })).toEqual(["matplotlib"]);
+	});
+
+	test("dotted names collapse to the installable top level, and repeats dedupe", () => {
+		const names = missingModuleNames({
+			name: "ModuleNotFoundError",
+			message: "No module named 'scipy.optimize'",
+			stack: ["ModuleNotFoundError: No module named 'scipy.optimize'", "ModuleNotFoundError: No module named 'scipy'"],
+		});
+		expect(names).toEqual(["scipy"]);
+	});
+
+	test("only import failures raise a hint", () => {
+		expect(missingModuleNames({ name: "NameError", message: "name 'app' is not defined", stack: [] })).toEqual([]);
+		// the module is there, the attribute inside it is not -- no package to install
+		expect(missingModuleNames({ name: "ImportError", message: "cannot import name 'erf' from 'math'", stack: [] })).toEqual([]);
+		expect(missingModuleNames({ name: "ImportError", message: "attempted relative import with no known parent package", stack: [] })).toEqual([]);
+		expect(missingModuleNames(undefined)).toEqual([]);
+	});
+
+	test("the pip name is not always the import name", () => {
+		expect(pipName("PIL")).toBe("pillow");
+		expect(pipName("win32com")).toBe("pywin32");
+		expect(pipName("sklearn")).toBe("scikit-learn");
+		expect(pipName("numpy")).toBe("numpy");
+	});
+
+	test("a uv machine without pip in the venv gets the uv form, and says why", () => {
+		const c = installerCommand(VENV_PY, ["matplotlib", "PIL"], { uv: true, pip: false });
+		expect(c.command).toContain("uv pip install --python");
+		expect(c.command).toContain(`"${VENV_PY}"`);
+		// the alias table has to reach the command, not just the note: pip has no package called PIL
+		expect(c.command).toContain("matplotlib pillow");
+		expect(c.note).toContain("no pip module");
+	});
+
+	test("a venv that does have pip gets the plain pip form", () => {
+		const pip = installerCommand(VENV_PY, ["numpy"], { uv: true, pip: true });
+		expect(pip.note).toBeUndefined();
+		const noUv = installerCommand(VENV_PY, ["numpy"], { uv: false, pip: false });
+		expect(noUv.command).toBe(`"${VENV_PY}" -m pip install numpy`);
+	});
+
+	test("the command carries the packages, not just the interpreter", () => {
+		// the regression this guards: an installer decision probed without the package list produces
+		// "uv pip install --python <py>" and installs nothing at all
+		const choice = installerChoice(VENV_PY, ["scipy", "no_such_pkg_here"], { uv: true, pip: false });
+		const joined = composeImportHint(["scipy", "no_such_pkg_here"], VENV_PY, choice).join("\n");
+		expect(joined).toContain("scipy no_such_pkg_here");
+		expect(joined).not.toMatch(/--python "[^"]+"\s*$/m);
+	});
+
+	test("the hint names the interpreter, the command, and the alias", () => {
+		const lines = composeImportHint(["PIL"], VENV_PY, installerCommand(VENV_PY, ["PIL"], { uv: true, pip: false }));
+		expect(lines.join("\n")).toContain(VENV_PY);
+		expect(lines.some((l) => l.includes("uv pip install"))).toBe(true);
+		expect(lines.some((l) => l.includes("PIL -> pillow"))).toBe(true);
+		// nothing to say when there is nothing missing, or when the interpreter is unknown
+		expect(composeImportHint([], VENV_PY)).toEqual([]);
+		expect(composeImportHint(["numpy"], undefined)).toEqual([]);
 	});
 });
