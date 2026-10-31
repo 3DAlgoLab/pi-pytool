@@ -120,12 +120,12 @@ npm run typecheck
 
 ## Status
 
-- Built and gated on Linux (pi 1.4.0, Python 3.14).
+- Built and gated on Linux (pi 1.4.0, Python 3.14, uv, bun).
 - **Windows: written to the measured rules of the reference (Win32 interrupt event handle, tree kill,
-  `Scripts/python.exe`, `py -3`, `pywin32` in the managed venv) but not yet run there.** The acceptance that
-  has to be measured on that machine: `tasklist` python count unchanged after a session, `$PI_PYTHON`
-  resolving into the same venv `draftsight-com` installs into, and a live DraftSight `connect()` → geometry
-  → kill kernel → reconnect smoke.
+  `Scripts/python.exe`, `py -3`, `pywin32` in the managed venv) but not yet run there.**
+  [HANDOFF.md](HANDOFF.md) is the Windows plan: the two test changes the gate needs first, the gate sequence,
+  the process-leak and interrupt measurements with a table to fill in, the DraftSight smoke, and a per-site
+  risk table for the platform-specific code.
 
 ## Not
 
