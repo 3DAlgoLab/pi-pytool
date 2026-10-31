@@ -152,15 +152,18 @@ stderr never showed `windows interrupt unavailable`. No `jupyter_client` pin was
 
 ## 7. COM smoke — the founding use case
 
-Prerequisite: DraftSight running, and the `draftsight-com` skill's package installed **into the kernel's own
-interpreter**. The kernel exports the interpreter it chose as `PI_PYTHON`, which is the shared contract with
-that skill — this is the exact failure the skill documents today (package installed into the wrong
-interpreter, import fails silently):
+Prerequisite: DraftSight running, and `draftsight_com` installed **into the kernel's own interpreter**. The
+kernel exports that interpreter as `PI_PYTHON`, and that is the entire contract with the skill. Installing
+somewhere else fails silently in the worst way: the install succeeds and the import still fails.
 
 ```powershell
-/pytool                                  # read the `python:` line; that is $env:PI_PYTHON's value
-uv pip install --editable --python $env:PI_PYTHON references\draftsight-com
+/pytool                                  # the `python:` line is $env:PI_PYTHON's value
+uv pip install --editable --python $env:PI_PYTHON D:\dev-pi\draftsight-com
 ```
+
+The package does not live inside this repo — there is no `references\draftsight-com` here, and there never
+was one. It has its own checkout, and on this box it is already installed editable as
+`draftsight-com 0.5.0` (§11.4).
 
 Then in one pi session:
 
@@ -245,6 +248,21 @@ in the kernel that died. DraftSight stayed up and operable, and the dead session
    exports `PI_PYTHON` into the *kernel's* environment, never into the pi process — measured unset there. So
    the bootstrap installs the package into a stale venv and reports `ready`. The package-only shape was
    measured working in §7: `uv pip install --python "$PI_PYTHON" --editable <repo>`, verified from inside a
-   cell. Recommendation: keep `draftsight-com` a Python package plus skill, and drop its extension layer.
+   cell. **Done (2026-10-31):** `draftsight-com` is now a Python package plus a skill file. Its
+   `extensions/index.ts`, `package.json`, `package-lock.json` and `tsconfig.json` are deleted (−2,032 lines,
+   +153), the distribution is renamed `prime-agent-skill-draftsight-com` → `draftsight-com` (the prefix only
+   existed to give the pi package a unique npm-style name), and `SKILL.md` is unchanged as a contract. pi's
+   package entry was removed with `pi remove git:github.com/3DAlgoLab/draftsight-com`; the skill is discovered
+   through a junction, `~/.pi/agent/skills/draftsight-com` → `D:\dev-pi\draftsight-com`, so `references/`
+   still resolves by relative path and there is one copy to maintain. Re-pointed and verified from a real
+   pytool cell: `draftsight_com.__version__` 0.5.0, `__file__` in the checkout, `sys.executable` ==
+   `PI_PYTHON`, help tree resolved, `app.GetVersion()` → 26.4.0.5067, import fine again on a fresh kernel.
 5. Two names in §7's procedure were wrong (`ActiveSheet`, `Line`, `Version`); corrected above against the
-   live build.
+   live build. Use `app.GetVersion()`, not `VersionString` — the late-bound IDispatch surface has no
+   `VersionString`, which one of my probe cells discovered the hard way.
+6. Two `draftsight_com` behaviours worth knowing before running §7 again. `docs.decompile()` anchors its
+   output tree to the **package** directory, not the working directory: an editable install unpacks the CHMs
+   into your checkout, a wheel install into `site-packages`, so an import that silently resolves to the wrong
+   install also silently writes its help tree somewhere else. And the help pages are UTF-8 while this console
+   is cp949 — the `ds-docs` CLI reconfigures its own stdout, a script calling `docs.lookup()` directly has to
+   do the same or it dies on the first non-breaking space.
