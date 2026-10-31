@@ -1,0 +1,8 @@
+node_modules/
+# harness state written by fabric while developing in this directory
+.pi/fabric/
+# vendored read-only reference trees, each its own repo
+references/
+.venv/
+*.log
+.DS_Store
