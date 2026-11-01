@@ -80,6 +80,7 @@ Start `pi` and send Python to `pytool`. Nothing to switch on; the kernel warms i
 | `PYTOOL_CELL_TIMEOUT_MS` | wall clock each cell gets when the caller named none; `0` (off) by default. One call can override it with `timeoutMs` |
 | `PYTOOL_BOOT_TIMEOUT_MS` | deadline for a kernel that boots but never answers (`90000`) |
 | `PYTOOL_SKIP_VENV=1` | skip the venv build at install time |
+| `PYTOOL_SHELL_PY` | how hard pytool pushes back when Python is routed through `bash` instead of the kernel: `warn` (default) appends one notice to the offending result, at most 3 per session; `block` refuses such a call outright; `off` says nothing |
 
 ## Interrupts, measured
 

@@ -2,12 +2,20 @@
 // --- No setActiveTools(), no namespace snapshots, no helper preloading — see README for why.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DEFAULT_MAX_OUTPUT_CHARS, EngineManager } from "./src/engine/index.js";
 import { formatDiagnostics } from "./src/extension/diagnostics.js";
 import { composeErrorLines } from "./src/extension/error-format.js";
 import { composeImportHint, missingModuleNames, probeInstaller } from "./src/extension/import-hint.js";
 import { pytoolGuidelines, pytoolToolDescription, pytoolToolSnippet } from "./src/extension/prompt.js";
+import {
+	composeShellPythonBlock,
+	composeShellPythonNotice,
+	detectShellPython,
+	shellPythonMode,
+	type ShellPythonMode,
+} from "./src/extension/shell-python.js";
 
 const pytoolSchema = Type.Object({
 	code: Type.String({
@@ -47,6 +55,10 @@ export default function (pi: ExtensionAPI) {
 	let cwd = process.cwd();
 	let engine: EngineManager | undefined;
 	let acquiring: Promise<EngineManager> | undefined;
+	// --- how hard pytool pushes back when Python is routed through the shell instead of the kernel
+	let shellPy: ShellPythonMode = shellPythonMode();
+	let nudgesUsed = 0;
+	const NUDGE_MAX = 3;
 
 	/** One engine per session; a boot that fails leaves no half-built manager behind. */
 	async function ensureEngine(): Promise<EngineManager> {
@@ -78,6 +90,8 @@ export default function (pi: ExtensionAPI) {
 	// --- the agent's others (read/bash/edit/write, fabric_exec, MCP), so it never hides them from the model.
 	pi.on("session_start", async (_event, ctx) => {
 		cwd = ctx.cwd ?? process.cwd();
+		shellPy = shellPythonMode();
+		nudgesUsed = 0;
 		// --- warm the kernel in the background; ensureEngine() dedupes, so the first cell awaits this boot
 		void ensureEngine().catch(() => {
 			// --- the first cell reports the boot failure itself; a warm-up rejection is nobody's business
@@ -112,6 +126,43 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		},
+	});
+
+	// --- The prompt states the rule once at startup; this restates it at the exact moment it would otherwise
+	// --- be broken silently. A bash call that feeds Python a heredoc, stdin, or an inline -c pays a cold
+	// --- interpreter and keeps nothing, which is the one thing pytool exists to prevent. `warn` (default)
+	// --- annotates the result and stops nagging after NUDGE_MAX calls; `block` refuses the call outright.
+	// --- A throwing tool_call handler blocks the tool as a pi fail-safe, so every path here is wrapped.
+	pi.on("tool_call", async (event) => {
+		try {
+			if (shellPy !== "block") return undefined;
+			if (!isToolCallEventType("bash", event)) return undefined;
+			const hit = detectShellPython((event.input as { command?: string }).command);
+			if (!hit) return undefined;
+			return { block: true, reason: composeShellPythonBlock(hit) };
+		} catch {
+			return undefined;
+		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		try {
+			if (shellPy === "off" || event.toolName !== "bash") return undefined;
+			if (nudgesUsed >= NUDGE_MAX) return undefined;
+			const hit = detectShellPython((event.input as { command?: string }).command);
+			if (!hit) return undefined;
+			nudgesUsed += 1;
+			const notice = composeShellPythonNotice(hit, nudgesUsed, NUDGE_MAX);
+			if (event.content.length > 0 && event.content[0]?.type === "text") {
+				// --- append inside the first text part so the tool result stays one block in the transcript
+				event.content[0].text = `${event.content[0].text}\n\n${notice}`;
+			} else {
+				event.content.push({ type: "text", text: notice });
+			}
+			return undefined;
+		} catch {
+			return undefined;
+		}
 	});
 
 	pi.registerTool<typeof pytoolSchema, PytoolDetails>({

@@ -8,6 +8,7 @@ import { managedVenvPython, pythonCandidates } from "../src/engine/python-locate
 import { formatDiagnostics } from "../src/extension/diagnostics.js";
 import { composeErrorLines } from "../src/extension/error-format.js";
 import { composeImportHint, installerChoice, installerCommand, missingModuleNames, pipName } from "../src/extension/import-hint.js";
+import { composeShellPythonBlock, composeShellPythonNotice, detectShellPython, shellPythonMode } from "../src/extension/shell-python.js";
 
 const FAKE_BRIDGE = join(import.meta.dir, "fixtures", "fake-bridge.py");
 
@@ -304,5 +305,91 @@ describe("import hints", () => {
 		// nothing to say when there is nothing missing, or when the interpreter is unknown
 		expect(composeImportHint([], VENV_PY)).toEqual([]);
 		expect(composeImportHint(["numpy"], undefined)).toEqual([]);
+	});
+});
+
+describe("shell python nudges", () => {
+	test("the mode comes from the environment, and junk means warn", () => {
+		expect(shellPythonMode({})).toBe("warn");
+		expect(shellPythonMode({ PYTOOL_SHELL_PY: "block" })).toBe("block");
+		expect(shellPythonMode({ PYTOOL_SHELL_PY: "OFF" })).toBe("off");
+		expect(shellPythonMode({ PYTOOL_SHELL_PY: "soon" })).toBe("warn");
+	});
+
+	test("heredoc, stdin, inline -c and end-of-pipe all route Python through the shell", () => {
+		for (const cmd of [
+			"python3 - <<'PY'\nprint(sum(range(10)))\nPY",
+			"python3 - <<EOF\nimport json\nEOF",
+			"python -c \"import json;print(json.load(open('x.json')))\"",
+			"curl -s https://x/y | python3 -c 'import sys,json;print(json.load(sys.stdin))'",
+			"echo 41 + 1 | python3",
+			"/home/me/.venv/bin/python3 - <<'PY'\nprint(1)\nPY",
+		]) {
+			expect(detectShellPython(cmd), cmd).toBeDefined();
+		}
+	});
+
+	test("real shell work is left alone", () => {
+		for (const cmd of [
+			"pip install scipy",
+			"uv pip install --python /home/me/.pi/agent/pytool/venv/bin/python3 lxml",
+			"python3 -m venv .venv",
+			"python3 -m pytest -q tests/",
+			"python3 scripts/setup-venv.mjs",
+			"python3 --version",
+			"python3 -m pip install --upgrade pip",
+			"cat > /tmp/probe.py <<'PY'\nprint(1)\nPY\npython3 /tmp/probe.py",
+			"node -e 'console.log(1)'",
+			"grep -rn 'python3' src/",
+		]) {
+			expect(detectShellPython(cmd), cmd).toBeUndefined();
+		}
+	});
+
+	test("empty and missing commands are not hits", () => {
+		expect(detectShellPython(undefined)).toBeUndefined();
+		expect(detectShellPython("   ")).toBeUndefined();
+	});
+
+	test("the notice names the kernel, the switch, and its own budget", () => {
+		const hit = detectShellPython("python3 - <<'PY'\nprint(1)\nPY")!;
+		const first = composeShellPythonNotice(hit, 1, 3);
+		expect(first).toContain("cold CPython");
+		expect(first).toContain("pytool");
+		expect(first).toContain("notice 1/3");
+		expect(first).toContain("PYTOOL_SHELL_PY");
+		// the last notice says it is the last one, so the nagging is visibly bounded
+		expect(composeShellPythonNotice(hit, 3, 3)).toContain("last notice");
+		expect(composeShellPythonBlock(hit)).toContain("PYTOOL_SHELL_PY=warn");
+	});
+});
+
+describe("heredoc bodies that carry data are not code", () => {
+	test("a commit message quoting the pattern does not read as running it", () => {
+		// what actually happened when this module shipped: the release commit itself was annotated,
+		// because its message quoted `python3 - <<'PY' ... PY` inside a `cat <<MSGEOF` payload
+		const msg = [
+			"cat > /tmp/pytool-050-msg.txt <<'MSGEOF'",
+			"0.5.0: push back when Python is routed through the shell",
+			"",
+			"The tool description told the model to send throwaway computation to a code mode, so the",
+			"work lands in bash as `python3 - <<'PY' ... PY` or `python -c \"...\"`: a cold interpreter.",
+			"MSGEOF",
+			"git commit -F /tmp/pytool-050-msg.txt",
+		].join("\n");
+		expect(detectShellPython(msg)).toBeUndefined();
+	});
+
+	test("a python script that is fed stdin data is ordinary shell work", () => {
+		expect(detectShellPython("python3 tools/render.py <<'EOF'\nrow\t1\nEOF")).toBeUndefined();
+	});
+
+	test("the interpreter's own heredoc survives the strip and still hits", () => {
+		for (const cmd of [
+			"python3 - <<'PY'\nprint(sum(range(10)))\nPY",
+			"cd /x && python3 - <<'PY'\nimport os\nprint(os.getcwd())\nPY",
+		]) {
+			expect(detectShellPython(cmd), cmd).toBeDefined();
+		}
 	});
 });
